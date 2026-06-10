@@ -19,6 +19,7 @@ typedef struct {
 	bool mask;
 	bool compress;
 	long long max_prealloc;
+	bool use_gpu;
 
 	bool premove;
 	long long stsl;

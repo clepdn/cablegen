@@ -8,13 +8,14 @@
 #include "format.h"
 #include "board.h"
 #include "settings.h"
+#include "cl_generate.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
 #include <fcntl.h>
-#include <time.h>
+#include <sys/resource.h>
 #define STR(x) #x
 #define EXPAND_STR(x) STR(x)
 #define VERSION_STR EXPAND_STR(VERSION)
@@ -52,11 +53,6 @@ void print_speed(uint64_t size){
 	}
 	if(!init){
 		init = true;
-/*		if(clock_getcpuclockid(0, &clock)){
-			log_out("Could not get system time, speed information will be disabled!", LOG_WARN);
-			enabled = false;
-			return;
-		} */
 		if(clock_gettime(CLOCK_MONOTONIC, &old_time)){
 			log_out("Could not get system time, speed information will be disabled!", LOG_WARN);
 			enabled = false;
@@ -140,13 +136,14 @@ void *generation_thread_move(void* data){ // n, nret
 	uint64_t old;
 	for(size_t i = args->start; i < args->end; i++){
 		old = args->n.bp[i];
-		tmp = old;
 		for(dir d = left; d <= down; d++){
+			tmp = old; /* reset every iteration: movedir_unstable can leave the
+			            * board rotated even on failure (up/down rotate before
+			            * the lock check), which would corrupt the input for
+			            * subsequent directions. */
 			if(movedir_unstable(&tmp, d)){
 				canonicalize_b(&tmp); // TODO it's not necessary to gen *all* boards in nox
-				
 				push_back(&args->nret, tmp);
-				tmp = old;
 			}
 		}
 	}
@@ -162,14 +159,14 @@ void *generation_thread_movep(void* data){ // n, nret, stsl, ltc, smallest_large
 		old = args->n.bp[i];
 		if(prune_board(old, args->stsl, args->ltc, args->smallest_large))
 			continue;
-		tmp = old;
 		for(dir d = left; d <= down; d++){
+			tmp = old; /* reset every iteration -- see comment in
+			            * generation_thread_move() above. */
 			if(movedir_unstable(&tmp, d)){
 				if(prune_board(tmp, args->stsl, args->ltc, args->smallest_large))
 					continue;
 				canonicalize_b(&tmp);
 				push_back(&args->nret, tmp);
-				tmp = old;
 			}
 		}
 	}
@@ -201,7 +198,7 @@ void *generation_thread_spawn(void* data){
 	return NULL;
 }
 
-static void init_threads(const dynamic_arr_info *n, const unsigned int core_count, enum thread_op op, arguments *cores, char nox, long layer){ 
+static void init_threads(const dynamic_arr_info *n, const unsigned int core_count, enum thread_op op, arguments *cores, char nox) {
 	// TODO make these ops work with solving too?
 	void *(*fn)(void*);
 	switch(op){
@@ -303,28 +300,222 @@ static void replace_n(dynamic_arr_info *n, arguments *cores, const unsigned int 
 	free(arrs);
 }
 
-void generate_layer(dynamic_arr_info* n, dynamic_arr_info* n2, dynamic_arr_info* n4, 
+#ifdef USE_OPENCL
+static bool try_dev_resident_layer(dynamic_arr_info* n,
+                                   dynamic_arr_info* n2,
+                                   dynamic_arr_info* n4,
+                                   const unsigned core_count,
+                                   const char *fmt_dir,
+                                   const int layer,
+                                   arguments *cores,
+                                   char nox)
+{
+	bool prune = get_settings()->prune;
+	start_node(MOVE);
+	cl_darr *moved = NULL;
+	bool ok = cl_move_dev(n->bp,
+	                     (size_t)(n->sp - n->bp),
+	                     prune,
+	                     (long)get_settings()->stsl,
+	                     (long)get_settings()->ltc,
+	                     (long)get_settings()->smallest_large,
+	                     &moved);
+	end_node(MOVE);
+	if (!ok) return false;
+
+	/* Copy device move result to host for write_boards. cl_spawn_dev
+	 * still consumes the device handle. */
+	dynamic_arr_info host_moved = { .valid = false };
+	if (!cl_darr_to_host(moved, &host_moved)) {
+		cl_darr_release(moved);
+		return false;
+	}
+	destroy_darr(n);
+	*n = host_moved;
+
+	start_node(SPAWN);
+	start_node(GEN_SPAWN);
+
+	cl_darr *gpu_n2 = NULL, *gpu_n4 = NULL;
+	bool spawn_ok = cl_spawn_dev(moved, &gpu_n2, &gpu_n4);
+	/* moved is consumed (released) by cl_spawn_dev whether it
+	 * succeeded or not, per its contract. */
+	moved = NULL;
+
+	start_node(WRITE);
+	write_boards((static_arr_info){.valid = n->valid, .bp = n->bp, .size = n->sp - n->bp}, fmt_dir, layer);
+	end_node(WRITE);
+	end_node(GEN_SPAWN);
+
+	start_node(COMBINE_SPAWN);
+	start_node(DEDUPE_SPAWN);
+
+	if (spawn_ok) {
+		dynamic_arr_info host_n2 = { .valid = false };
+		dynamic_arr_info host_n4 = { .valid = false };
+		bool d2 = cl_darr_download(gpu_n2, &host_n2);
+		bool d4 = cl_darr_download(gpu_n4, &host_n4);
+		if (!d2 || !d4) {
+			if (d2) destroy_darr(&host_n2);
+			if (d4) destroy_darr(&host_n4);
+			end_node(COMBINE_SPAWN);
+			end_node(DEDUPE_SPAWN);
+			end_node(SPAWN);
+			log_out("cl_darr_download failed; falling back to CPU spawn.", LOG_WARN);
+			goto cpu_spawn_fallback;
+		}
+
+		dynamic_arr_info arrs2[2] = { host_n2, *n2 };
+		*n2 = deduplicate_threads(arrs2, 2);
+		destroy_darr(&arrs2[0]);
+		destroy_darr(&arrs2[1]);
+
+		dynamic_arr_info arrs4[2] = { host_n4, *n4 };
+		*n4 = deduplicate_threads(arrs4, 2);
+		destroy_darr(&arrs4[0]);
+		destroy_darr(&arrs4[1]);
+
+		end_node(COMBINE_SPAWN);
+		end_node(DEDUPE_SPAWN);
+		end_node(SPAWN);
+		return true;
+	}
+
+cpu_spawn_fallback:
+	/* Move already happened on device; *n holds the host copy of the
+	 * sorted+deduped move result. Run CPU spawn on it. */
+	log_out("cl_spawn_dev failed; running CPU spawn on device-resident move output.", LOG_DBG);
+	init_threads(n, core_count, spawn, cores, nox);
+	wait(cores, core_count);
+	{
+		dynamic_arr_info *arrs = get_darr_arr_and(cores, core_count, 1, true);
+		arrs[core_count] = *n2;
+		*n2 = deduplicate_threads(arrs, core_count + 1);
+		for(size_t i = 0; i < core_count + 1; i++) destroy_darr(arrs + i);
+		free(arrs);
+		arrs = get_darr_arr_and(cores, core_count, 1, false);
+		arrs[core_count] = *n4;
+		*n4 = deduplicate_threads(arrs, core_count + 1);
+		for(size_t i = 0; i < core_count + 1; i++) destroy_darr(arrs + i);
+		free(arrs);
+	}
+	end_node(COMBINE_SPAWN);
+	end_node(DEDUPE_SPAWN);
+	end_node(SPAWN);
+	return true;
+}
+#endif /* USE_OPENCL */
+
+void generate_layer(dynamic_arr_info* n, dynamic_arr_info* n2, dynamic_arr_info* n4,
 		const unsigned core_count, const char *fmt_dir, const int layer, arguments *cores, char nox){
-	// move
+#ifdef USE_OPENCL
+	const bool use_gpu = get_settings()->use_gpu;
+	if (use_gpu) {
+		if (try_dev_resident_layer(n, n2, n4, core_count, fmt_dir, layer, cores, nox))
+			return;
+		log_out("Device-resident layer path failed; falling back to old path.", LOG_WARN);
+	}
+#endif
 	start_node(MOVE);
 	start_node(GEN_MOVE);
 
+#ifdef USE_OPENCL
+	{
+		dynamic_arr_info gpu_out = { .valid = false };
+		if (use_gpu) {
+			bool prune = get_settings()->prune;
+			gpu_out = cl_move_boards(
+				n->bp,
+				(size_t)(n->sp - n->bp),
+				prune,
+				(long)get_settings()->stsl,
+				(long)get_settings()->ltc,
+				(long)get_settings()->smallest_large);
+		}
+		if(gpu_out.valid){
+			end_node(GEN_MOVE);
+			start_node(COMBINE_MOVE);
+			start_node(DEDUPE_MOVE);
+			destroy_darr(n);
+			/* deduplicate_threads expects per-thread sorted arrays.
+			 * cl_move_boards returns a single sorted array, so feed it
+			 * as a one-element arrs[] to keep the dedupe path identical. */
+			dynamic_arr_info one[1] = { gpu_out };
+			*n = deduplicate_threads(one, 1);
+			destroy_darr(&one[0]);
+		} else {
+			if (use_gpu)
+				log_out("OpenCL move failed; falling back to CPU pthread path.", LOG_WARN);
+			if(get_settings()->prune)
+				init_threads(n, core_count, movep, cores, nox);
+			else
+				init_threads(n, core_count, move, cores, nox);
+			replace_n(n, cores, core_count);
+		}
+	}
+#else
 	if(get_settings()->prune)
-		init_threads(n, core_count, movep, cores, nox, layer);
+		init_threads(n, core_count, movep, cores, nox);
 	else
-		init_threads(n, core_count, move, cores, nox, layer);
-	// wait for moves to be done
-	replace_n(n, cores, core_count); // this array currently holds boards where we just spawned -- these are never our responsibility
+		init_threads(n, core_count, move, cores, nox);
+	replace_n(n, cores, core_count);
+#endif
 
 	end_node(COMBINE_MOVE);
 	end_node(DEDUPE_MOVE);
 	end_node(MOVE);
 
-	// spawn
 	start_node(SPAWN);
 	start_node(GEN_SPAWN);
 
-	init_threads(n, core_count, spawn, cores, nox, layer);
+#ifdef USE_OPENCL
+	{
+		dynamic_arr_info gpu_n2 = { .valid = false };
+		dynamic_arr_info gpu_n4 = { .valid = false };
+		bool gpu_ok = use_gpu &&
+		              cl_spawn_boards(n->bp,
+		                              (size_t)(n->sp - n->bp),
+		                              &gpu_n2, &gpu_n4);
+
+		start_node(WRITE);
+		write_boards((static_arr_info){.valid = n->valid, .bp = n->bp, .size = n->sp - n->bp}, fmt_dir, layer);
+		end_node(WRITE);
+		end_node(GEN_SPAWN);
+		start_node(COMBINE_SPAWN);
+		start_node(DEDUPE_SPAWN);
+
+		if (gpu_ok) {
+			/* Merge GPU result with the n2/n4 carried over from the
+			 * previous layer. deduplicate_threads expects sorted inputs;
+			 * the GPU helper already sorted gpu_n2/gpu_n4. */
+			dynamic_arr_info arrs2[2] = { gpu_n2, *n2 };
+			*n2 = deduplicate_threads(arrs2, 2);
+			destroy_darr(&arrs2[0]);
+			destroy_darr(&arrs2[1]);
+
+			dynamic_arr_info arrs4[2] = { gpu_n4, *n4 };
+			*n4 = deduplicate_threads(arrs4, 2);
+			destroy_darr(&arrs4[0]);
+			destroy_darr(&arrs4[1]);
+		} else {
+			if (use_gpu)
+				log_out("OpenCL spawn failed; falling back to CPU pthread path.", LOG_WARN);
+			init_threads(n, core_count, spawn, cores, nox);
+			wait(cores, core_count);
+			dynamic_arr_info *arrs = get_darr_arr_and(cores, core_count, 1, true);
+			arrs[core_count] = *n2;
+			*n2 = deduplicate_threads(arrs, core_count + 1);
+			for(size_t i = 0; i < core_count + 1; i++) destroy_darr(arrs + i);
+			free(arrs);
+			arrs = get_darr_arr_and(cores, core_count, 1, false);
+			arrs[core_count] = *n4;
+			*n4 = deduplicate_threads(arrs, core_count + 1);
+			for(size_t i = 0; i < core_count + 1; i++) destroy_darr(arrs + i);
+			free(arrs);
+		}
+	}
+#else
+	init_threads(n, core_count, spawn, cores, nox);
 	// write while waiting for spawns
 	
 	start_node(WRITE);
@@ -337,7 +528,6 @@ void generate_layer(dynamic_arr_info* n, dynamic_arr_info* n2, dynamic_arr_info*
 	start_node(DEDUPE_SPAWN);
 
 	wait(cores,core_count);
-	// concatenate spawns
 	dynamic_arr_info *arrs = get_darr_arr_and(cores, core_count, 1, true);
 	arrs[core_count] = *n2;
 	*n2 = deduplicate_threads(arrs, core_count + 1);
@@ -352,6 +542,7 @@ void generate_layer(dynamic_arr_info* n, dynamic_arr_info* n2, dynamic_arr_info*
 		destroy_darr(arrs + i);
 	}
 	free(arrs);
+#endif
 
 	end_node(COMBINE_SPAWN);
 	end_node(DEDUPE_SPAWN);
@@ -362,6 +553,9 @@ void generate(const int start, const int end, const char *fmt, const static_arr_
 	open_bench("bench/"VERSION_STR".gv", "generate");
 
 	generate_lut();
+#ifdef USE_OPENCL
+	if(get_settings()->use_gpu && cl_init()) cl_upload_luts();
+#endif
 	static const size_t DARR_INITIAL_SIZE = 100;
 	long long core_count = get_settings()->min.cores;
 	long long nox = get_settings()->min.nox;
@@ -400,6 +594,22 @@ void generate(const int start, const int end, const char *fmt, const static_arr_
 	destroy_darr(&n2);
 	destroy_darr(&n4);
 	free(cores);
+#ifdef USE_OPENCL
+	{
+		size_t vram = cl_vram_bytes();
+		logf_out("Peak VRAM use: %.2f MiB", LOG_INFO, vram / (1024.0 * 1024.0));
+	}
+	cl_shutdown();
+#endif
+	{
+		struct rusage ru;
+		if (getrusage(RUSAGE_SELF, &ru) == 0) {
+			/* Linux reports ru_maxrss in KiB; macOS in bytes. We're on
+			 * Linux per the build target, so multiply by 1024 for bytes. */
+			double mib = (double)ru.ru_maxrss / 1024.0;
+			logf_out("Peak host RSS:  %.2f MiB", LOG_INFO, mib);
+		}
+	}
 
 	end_bench();
 }

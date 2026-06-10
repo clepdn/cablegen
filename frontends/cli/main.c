@@ -142,6 +142,7 @@ static void parseWrite(int argc, char **argv){
 	if(argc < 2){ log_out("Not enough arguments!", LOG_ERROR); help(); exit(EXIT_FAILURE); }
 	dynamic_arr_info boards = init_darr(0, 1);
 	for(int i = 2; i < argc; i++){
+		errno = 0;
 		uint64_t board = strtoull(argv[i], NULL, 16); // interpret as hex string
 		if (errno != 0){
 			printf("Error parsing string! %s\n", strerror(errno));

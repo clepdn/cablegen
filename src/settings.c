@@ -39,7 +39,9 @@ settings_t *get_settings(void){
 		.min.nox = 0,
 		.mask = 0,
 		.compress = false,
-		
+		.use_gpu = true,
+
+
 		.premove = false,
 		.min.bdir = "./boards/",
 		.min.initial = "./initial",
@@ -64,8 +66,9 @@ settings_t *get_settings(void){
 	get_int_setting("cores", &res.min.cores); 
 	get_int_setting("nox", &res.min.nox); 
 	get_bool_setting("mask", &res.mask); 
-	get_bool_setting("compress", &res.compress); 
-	get_int_setting("max_prealloc", &res.max_prealloc); 
+	get_bool_setting("compress", &res.compress);
+	get_int_setting("max_prealloc", &res.max_prealloc);
+	get_bool_setting("use_gpu", &res.use_gpu);
 	get_bool_setting_section("premove", "Generate", &res.premove);
 	get_str_setting_section("dir", "Generate", &res.min.bdir);
 	get_str_setting_section("initial", "Generate", &res.min.initial);

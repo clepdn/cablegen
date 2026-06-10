@@ -12,6 +12,12 @@ BUILD=prod
 PLATFORM=linux
 LDFLAGS=-flto
 LIBTYPE=static
+BUILD_OPENCL=0
+
+ifeq ($(BUILD_OPENCL),1)
+CCFLAGS_SHARED += -DUSE_OPENCL
+LDFLAGS += -lOpenCL
+endif
 
 ifeq ($(BUILD),e)
 FILES=$(addsuffix .c,$(addprefix ppc/,$(notdir $(basename $(wildcard src/*.c)))))
@@ -20,7 +26,7 @@ FILES=$(addsuffix .o,$(addprefix build/,$(notdir $(basename $(wildcard src/*.c))
 endif
 
 CCFLAGS_SHARED += -DVERSION=$$(git describe --tags --always --dirty)
-.PHONY: all clean default gen_conf frontends
+.PHONY: all clean default gen_conf frontends bench bench_full
 
 ifeq ($(PLATFORM),windows)
 CC=x86_64-w64-mingw32-gcc
@@ -71,11 +77,33 @@ all: $(FILES) $(LIB_FILE)
 
 frontends:
 	@echo [frontends]
-	@make -C frontends/ all PLATFORM=$(PLATFORM) BUILD=$(BUILD) LIBTYPE=$(LIBTYPE)
+	@make -C frontends/ all PLATFORM=$(PLATFORM) BUILD=$(BUILD) LIBTYPE=$(LIBTYPE) BUILD_OPENCL=$(BUILD_OPENCL)
 
 gen_conf:
 	@echo [gen_conf]
 	@make -C gen_conf/ all PLATFORM=$(PLATFORM)
+
+BENCH_SRCS = $(wildcard src/*.c) $(wildcard inc/*.h) $(wildcard frontends/cli/*.c) $(wildcard frontends/cli/*.h)
+
+bench_cpu: $(BENCH_SRCS)
+	@echo [BENCH] building CPU binary
+	@$(MAKE) clean > /dev/null
+	@$(MAKE) BUILD=bench BUILD_OPENCL=0 > /dev/null
+	@$(MAKE) -C frontends/ all BUILD=bench LIBTYPE=static BUILD_OPENCL=0 > /dev/null
+	@cp frontends/cli/cli $@
+
+bench_gpu: $(BENCH_SRCS)
+	@echo [BENCH] building GPU binary
+	@$(MAKE) clean > /dev/null
+	@$(MAKE) BUILD=bench BUILD_OPENCL=1 > /dev/null
+	@$(MAKE) -C frontends/ all BUILD=bench LIBTYPE=static BUILD_OPENCL=1 > /dev/null
+	@cp frontends/cli/cli $@
+
+bench: bench_cpu bench_gpu
+	@bash bench_cpu_vs_gpu.sh
+
+bench_full: bench_cpu bench_gpu
+	@bash bench_cpu_vs_gpu.sh 300
 
 clean: 
 	@rm -f build/*
